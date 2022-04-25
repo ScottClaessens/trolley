@@ -1,0 +1,871 @@
+---
+title: "Classic Trolley"
+output:
+  html_document: default
+  html_notebook: default
+---
+
+#Libraries
+
+```{r Libraries}
+library(ggrepel)
+library(tidyverse)
+library(lme4)
+library(hrbrthemes)
+library(ggthemes)
+library(countrycode)
+library(meta)
+library(cowplot)
+library(ggrepel)
+library(stargazer)
+library(sparkTable)
+library(GGally)
+library(data.table)
+library(lm.beta)
+
+
+# To get the same font in figures, first add Roboto Condensed, then load fonts below.
+library(extrafont)
+loadfonts()
+```
+
+# Main Figures
+## Fig. 2: Main Results plot
+```{r data carpentry for main plot}
+
+dp3 = read_csv("Shared_data_allResponses.csv") %>%  
+  mutate(Continent = countrycode(sourcevar = country_code,
+                            origin = "iso2c",
+                            destination = "continent"),
+         Continent = factor(Continent,
+                            levels = c("Oceania", "Americas", "Europe", "Asia"),
+                            labels = c("Oc.", "Americas", "Europe", "Asia"))) %>% 
+  group_by(country_code, Continent, Scenario) %>% 
+  summarize(Acceptance = mean(Outcome),
+            N = n()) %>% 
+  filter(N > 200) %>% 
+  na.omit() 
+
+```
+
+```{r main plot in sepia color scheme}
+
+BYCONT2 =  ggplot(dp3, aes(x = reorder(country_code, -Acceptance), Acceptance, fill = Scenario, group = country_code))+
+    geom_hline(aes(yintercept = .5), linetype = "dotted")+
+  geom_path(data = filter(dp3, Scenario != 'Switch'),  color = '#e2aaa2', size = 2.8) +
+  geom_path(data = filter(dp3, Scenario != 'Footbridge'),  color = '#e0d2bd', size = 2.8) +
+  geom_point(size = 2, shape = 21) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(.3, .9))+
+  labs(title = '',
+       x = "",
+       y = ""
+     )+
+  facet_grid(.~Continent, drop = T, scales = "free_x", space = "free_x")+
+  theme_ipsum_rc()+
+  scale_fill_manual(name = "", values = c("#b44638","white", "#b08c55"), labels = c("Footbridge", "Loop", "Switch"), guide = guide_legend(reverse = TRUE))+
+  theme(axis.text.x = element_text(size = 7),
+        axis.text.y = element_text(size = 8),
+        aspect.ratio = 10/1,
+        legend.position = c("right"))
+  
+
+ggsave(BYCONT2, file = "Classic_by_continent.png", width = 9)
+```
+
+#Fig.3: Funnel plots
+
+```{r Carpentry}
+
+d = read_csv("Shared_data_allResponses.csv") %>% 
+  spread(Scenario, Outcome) %>%
+  group_by(Session_id, country_code, UserID) %>%
+  summarize(Switch = mean(Switch, na.rm = T),
+            Loop = mean(Loop,na.rm = T),
+            Footbridge = mean(Footbridge, na.rm = T)) %>%
+  filter(!is.nan(Loop), !is.nan(Switch), !is.nan(Footbridge)) %>%
+  ungroup() %>%
+ gather(Scenario, Outcome, Switch:Footbridge) %>%
+  mutate(Scenario = factor(Scenario, levels = c("Loop", "Footbridge", "Switch")),
+         Session_id = paste("sn", Session_id, sep = ""))
+
+bigcountries = d %>% 
+  group_by(country_code, Scenario) %>% 
+  summarize(sample = n()) %>% 
+  filter(sample > 199) %>% 
+  distinct(country_code) %>% 
+  pull()
+  
+d = d %>% filter(country_code %in% bigcountries)
+```
+
+
+```{r cohen h per country}
+dcohen = d %>% 
+  group_by(country_code, Scenario) %>% 
+  summarize(prop = mean(Outcome)#,
+            #size = n()
+            ) %>% 
+  spread(Scenario, prop) %>% 
+  mutate(SL = pwr::ES.h(Switch, Loop),
+         LF = pwr::ES.h(Loop, Footbridge))
+  
+```
+
+```{r meta-analysis and funnel for Switch vs Loop}
+
+dSL = d %>% 
+  filter(Scenario != "Footbridge") %>% 
+  group_by(country_code, Scenario) %>% 
+  summarise(yes = sum(Outcome),
+            size = n()) %>% 
+  spread(Scenario, yes) %>% 
+  rename(event.e = Switch,
+         n.e = size,
+         event.c = Loop) %>% 
+  mutate(n.c = n.e)
+
+
+SL = metabin(data = dSL, studlab = country_code, event.e = event.e, n.e = n.e, event.c = event.c, n.c = n.c, sm = "ASD")
+
+
+
+funnel(SL, text = SL$studlab, cex = .5)
+
+plot.dSL = tibble(
+  Country = SL$studlab,
+  h = SL$TE,
+  Error = SL$seTE)%>% 
+  mutate(Continent = countrycode(sourcevar = Country,
+                            origin = "iso2c",
+                            destination = "continent"),
+         Continent = factor(Continent, levels = c("Europe","Americas", "Asia","Oceania")))
+
+anno_dSL = tibble(
+  TE.fixed = SL$TE.fixed,
+  seTE.fixed = SL$seTE.fixed,
+  se.seq=seq(0, 0.049, 0.001),
+  ll95 = TE.fixed-(1.96*se.seq),
+  ul95 = TE.fixed+(1.96*se.seq)
+)
+
+SvL = ggplot(plot.dSL, aes(h, Error, color = Continent))+
+  geom_line(aes(y = se.seq, x = ll95), linetype = 'dotted', data = anno_dSL, color = "black") +
+  geom_line(aes(y = se.seq, x = ul95), linetype = 'dotted', data = anno_dSL, color = "black") +
+  geom_segment(data = anno_dSL, aes(x = TE.fixed, y = .049, xend = TE.fixed, yend = 0),linetype = 'dotted', color = "black")+
+    geom_point(size = 2)+
+  geom_text(data = filter(plot.dSL, h > .15), aes(label = Country), show.legend = F, nudge_y = .002, size = 2.5, color = "black", family = "Roboto Condensed")+
+  labs(title = "Switch is endorsed more than Loop", 
+       subtitle = "But the effect size is small",
+       x = "Cohen's h for difference in proportion", 
+       y = "Standard error")+
+  scale_color_ipsum(name = "")+
+  scale_y_reverse()+
+  theme_ipsum_rc() +
+  theme(panel.grid = element_blank(),
+        axis.line = element_line(color = "black"),
+        legend.position = c(.10,.75),
+        aspect.ratio = 1/1.7,
+         plot.margin = unit(c(0,0,.25,.25), "cm"))
+
+```
+
+```{r now for Loop vs Footbridge}
+
+dLF = d %>% 
+  filter(Scenario != "Switch") %>% 
+  group_by(country_code, Scenario) %>% 
+  summarise(yes = sum(Outcome),
+            size = n()) %>% 
+  spread(Scenario, yes) %>% 
+  rename(event.e = Loop,
+         n.e = size,
+         event.c = Footbridge) %>% 
+  mutate(n.c = n.e)
+
+LF = metabin(data = dLF, studlab = country_code, event.e = event.e, n.e = n.e, event.c = event.c, n.c = n.c, sm = "ASD")
+
+funnel(LF)
+
+plot.dLF = tibble(
+  Country = LF$studlab,
+  h = LF$TE,
+  Error = LF$seTE)%>% 
+  mutate(Continent = countrycode(sourcevar = Country,
+                            origin = "iso2c",
+                            destination = "continent"),
+         Continent = factor(Continent, levels = c("Europe","Americas", "Asia","Oceania")))
+
+anno_dLF = tibble(
+  TE.fixed = LF$TE.fixed,
+  seTE.fixed = LF$seTE.fixed,
+  se.seq=seq(0, 0.049, 0.001),
+  ll95 = TE.fixed-(1.96*se.seq),
+  ul95 = TE.fixed+(1.96*se.seq)
+)
+
+LvF = ggplot(plot.dLF, aes(h, Error, color = Continent))+
+  geom_line(aes(y = se.seq, x = ll95), linetype = 'dotted', data = anno_dLF, color = "black") +
+  geom_line(aes(y = se.seq, x = ul95), linetype = 'dotted', data = anno_dLF, color = "black") +
+  geom_segment(data = anno_dLF, aes(x = TE.fixed, y = .049, xend = TE.fixed, yend = 0),linetype = 'dotted', color = "black")+
+    geom_point(size = 2)+
+  geom_text(data = filter(plot.dLF, h < .17), aes(label = Country), show.legend = F, nudge_y = .002, size = 2.5, color = "black", family = "Roboto Condensed")+
+  geom_text(data = filter(plot.dLF, h > .25, Error <.022), aes(label = Country), show.legend = F, nudge_y = .002, size = 2.5, color = "black", family = "Roboto Condensed")+
+  geom_text(data = filter(plot.dLF, h > .28, Error <.03), aes(label = Country), show.legend = F, nudge_y = .002, size = 2.5, color = "black", family = "Roboto Condensed")+
+  labs(title = "Loop is endorsed more than Footbridge", 
+       subtitle = "The effect size is larger but more heterogeneous",
+       x = "Cohen's h for difference in proportion", 
+       y = "Standard error")+
+  scale_color_ipsum(name = "")+
+  scale_y_reverse()+
+  theme_ipsum_rc() +
+  theme(panel.grid = element_blank(),
+        axis.line = element_line(color = "black"),
+        legend.position = "none",
+        aspect.ratio = 1/1.7,
+         plot.margin = unit(c(0,.25,.25,0), "cm"))
+```
+
+```{r}
+Funnels = plot_grid(SvL, LvF, ncol = 2, labels = c("A","B"))
+
+ggsave(Funnels, file = "ClassicFunnels.png", width = 10)
+```
+
+
+##Fig. 4: Country level correlates
+
+```{r}
+load("countrylevelregressions.rdata")
+
+dcs = ddl %>% mutate(Continent = countrycode(sourcevar = two_letter_code,
+                                             origin = "iso2c",
+                                             destination = "continent"),
+                     Continent = factor(Continent,
+                                        levels = c("Europe","Americas", "Asia","Oceania"))) %>% 
+  filter(!is.na(Continent)) %>% 
+  select(two_letter_code, Continent, RML, Switch, Loop, Footbridge) %>% 
+  gather(Scenario, Prop, Switch:Footbridge) 
+
+         
+```
+
+```{r scatterplot with focus on Asia}
+
+RM = ggplot(dcs, aes(RML, Prop))+
+  geom_smooth(data = filter(dcs, Continent == "Asia"), method = "lm", color = "black", fill = "grey90", size = .5, linetype = "dotted")+
+  geom_point(aes(color = Continent), size = 1.5)+
+  geom_text(data = filter(dcs, Continent == 'Asia'), aes(label = two_letter_code), show.legend = F, nudge_x = 0, nudge_y = .03, size = 2.5, color = "black", family = "Roboto Condensed")+
+  labs(title  = "Country-level correlates of moral decisions",
+       subtitle = "Relational mobility is a strong predictor of moral decisions (even after controlling for individualism, GDP\nor religiosity), primarily due to variation among Asian countries.",
+       x = "Relational Mobility",
+       y = "Proportion taking action")+
+  facet_wrap(~fct_rev(Scenario), ncol = 3, scales = "free_y")+
+  scale_color_ipsum(name = "")+
+  theme_ipsum_rc()+
+  theme(aspect.ratio = 1/1,
+        axis.line = element_line(color = "black", size = .25),
+        panel.grid = element_line(color = "gray99"),
+        legend.position = "top",
+        legend.justification='left',
+        legend.direction='horizontal',
+        panel.spacing = unit(0, "null"))
+
+
+ggsave(RM, file = "RM_Asia_focus.png", width = 8.5)
+```
+##Fig. 4 (bottom)
+```{r}
+load("countrylevelregressions.rdata")
+
+dd = ddl %>% mutate(Continent = countrycode(sourcevar = two_letter_code,
+                                            origin = "iso2c",
+                                            destination = "continent"),
+                    Continent = factor(Continent,
+                                       levels = c("Europe","Americas", "Asia","Oceania"))) %>%
+  filter(!is.na(Continent))
+
+```
+
+```{r}
+Switch.Indiv = lm(Switch ~ RML + Individualism, data = dd) %>% lm.beta(.)
+Switch.GDP = lm(Switch ~ RML + GDP_log10, data = dd) %>% lm.beta()
+Switch.Reli = lm(Switch ~ RML + Religion_is_very_important, data = dd) %>% lm.beta()
+
+summary(Switch.Indiv)
+summary(Switch.GDP)
+summary(Switch.Reli)
+
+Loop.Indiv = lm(Loop ~ RML + Individualism, data = dd) %>% lm.beta(.)
+Loop.GDP = lm(Loop ~ RML + GDP_log10, data = dd) %>% lm.beta()
+Loop.Reli = lm(Loop ~ RML + Religion_is_very_important, data = dd) %>% lm.beta()
+
+summary(Loop.Indiv)
+summary(Loop.GDP)
+summary(Loop.Reli)
+
+Footbridge.Indiv = lm(Footbridge ~ RML + Individualism, data = dd) %>% lm.beta(.)
+Footbridge.GDP = lm(Footbridge ~ RML + GDP_log10, data = dd) %>% lm.beta()
+Footbridge.Reli = lm(Footbridge ~ RML + Religion_is_very_important, data = dd) %>% lm.beta()
+
+summary(Footbridge.Indiv)
+summary(Footbridge.GDP)
+summary(Footbridge.Reli)
+
+```
+
+
+#Supplemential Information (SI) figures
+
+
+# Section: Demographics
+
+## Table S1: Regression table for demographics
+```{r multilevel regressions, one interceot per country}
+dem <- read_csv("Shared_data_responses_demographics.csv")
+dem$survey.education <- factor(dem$survey.education,levels = c("No College","College"))
+
+model0footbridge = glmer(Outcome ~ survey.gender + scale(survey.age) + survey.education + scale(survey.political) + scale(survey.religious) + (1|country_code), family = 'binomial', data = filter(dem, Scenario == 'Footbridge'))
+
+model0loop = glmer(Outcome ~ survey.gender + scale(survey.age) + survey.education + scale(survey.political) + scale(survey.religious) + (1|country_code), family = 'binomial', data = filter(dem, Scenario == 'Loop'))
+
+model0switch = glmer(Outcome ~ survey.gender + scale(survey.age) + survey.education + scale(survey.political) + scale(survey.religious) + (1|country_code), family = 'binomial', data = filter(dem, Scenario == 'Switch'))
+
+stargazer(model0switch, model0loop, model0footbridge, type = 'text', column.labels = c('Switch', 'Loop', 'Footbridge'), star.cutoffs = c(.01, .001, .0001))
+```
+
+
+
+## descriptive demographics (survey)
+
+```{r}
+d <- read_csv("Shared_data_responses_demographics.csv")
+
+# run each of the following lines separately to see output
+length(unique(d$UserIP_Anonymized))
+d %>% select(UserIP_Anonymized, survey.gender) %>% distinct() %>% count(survey.gender)
+d %>% select(UserIP_Anonymized, survey.age) %>% distinct() %>% summary(survey.age)
+d %>% select(UserIP_Anonymized, survey.education) %>% distinct() %>% count(survey.education)
+d %>% filter(survey.gender == "Men", survey.education == "College", survey.age < 32) %>% select(UserIP_Anonymized) %>% distinct() %>% count()
+d %>% select(UserIP_Anonymized, survey.political) %>% distinct() %>% summary(survey.political)
+d %>% select(UserIP_Anonymized, survey.religious) %>% distinct() %>% summary(survey.religious)
+
+```
+
+20,108 unique ip addresses
+75% male
+75% younger than 32
+73% college educated
+
+37% of survey takers are young college-educated men
+
+lean progressive (37 on a scale from 0 progressive to 100 conservative)
+lean secular (25 on a scale from 0 not religious to 100 religious)
+
+filtering out countries in which we have less than 200 surveys, we have 22 countries and 17,407 unique ip addresses
+
+##Fig. S1: Table for demographic breakdown - Sparktable 
+
+```{r}
+toosmall = d %>% 
+ select(-Scenario, -Outcome) %>% distinct() %>% 
+  group_by(country_code) %>% 
+ summarize(N = n()) %>% 
+ filter(N < 200) %>%
+   distinct(country_code) %>% 
+  pull()
+
+
+
+demdata = d %>% 
+  select(-Scenario, -Outcome) %>% 
+  distinct() %>% 
+  filter(country_code %in% toosmall == F) %>% 
+  arrange(country_code) %>%  
+  select(country_code, survey.gender, survey.education, survey.age, survey.political, survey.religious) %>% 
+  mutate(survey.gender = ifelse(survey.gender == 'Men', 1, 0),
+         survey.education = ifelse(survey.education == 'College', 1, 0))
+```
+
+
+```{r hacking the AT_Soccer dataset }
+time = 1
+
+for(i in 2:17407){
+  time[i] = ifelse(demdata$country_code[i] == demdata$country_code[i-1], time[i-1]+1, 1)
+}
+
+demdata = add_column(demdata, time, .after = "country_code") %>% mutate(country_code = factor(country_code))
+
+hackdata = demdata %>%  group_by(country_code)
+
+data(AT_Soccer, package = "sparkTable")
+
+names(hackdata) = names(AT_Soccer)
+
+AT_Soccer = rbind.data.frame(AT_Soccer, hackdata) %>%  filter(str_length(team) == 2) 
+
+```
+
+
+```{r generate the sparktable object and the output files}
+content = list(
+  function(x){ round(100*mean(x), 0) },
+  function(x){ round(100*mean(x), 0) },
+  newSparkHist(barCol = c("white", "black", "white"), barSpacingPerc = .1),
+  newSparkHist(barCol = c("white", "black", "white"), barSpacingPerc = .1),
+  newSparkHist(barCol = c("white", "black", "white"), barSpacingPerc = .1)
+)
+
+names(content) = c("% Men", "% College", "Age", "Politics", "Religiosity")
+
+vars = c("points", "wl", "goaldiff", "shotgoal", "getgoal")
+
+stab = newSparkTable(AT_Soccer, content, vars)
+
+export(stab, outputType = "tex", filename = "first-stab")
+```
+
+```{r getting the Ns for the table}
+hackdata %>% group_by(team) %>% count()
+```
+
+##Fig. S2: Impact of Demographic traits
+
+```{r carpentry for the demographic effects plot}
+
+toosmall = d %>% 
+ select(-Scenario, -Outcome) %>% distinct() %>% 
+  group_by(country_code) %>% 
+ summarize(N = n()) %>% 
+ filter(N < 200) %>%
+   distinct(country_code) %>% 
+  pull()
+
+de0 = d %>% 
+  filter(country_code %in% toosmall == F) %>% 
+  select(Continent, Scenario, country_code, survey.gender, survey.education, survey.age, survey.political, survey.religious, Outcome) %>% 
+  mutate(survey.gender = ifelse(survey.gender == 'Men', 1, 0),
+         survey.education = ifelse(survey.education == 'College', 1, 0))
+
+medians = de0 %>% 
+  group_by(country_code) %>% 
+  summarise(med.age = median(survey.age),
+            med.pol = median(survey.political),
+            med.rel = median(survey.religious))
+
+de = inner_join(de0, medians) 
+
+de = de %>% 
+  rowwise() %>% 
+  mutate(survey.age = ifelse(survey.age - med.age <=0, 0, 1),
+         survey.political = ifelse(survey.political - med.pol <=0, 0, 1),
+         survey.religious = ifelse(survey.religious - med.rel<=0, 0, 1))
+  
+de1 = de %>% 
+  group_by(Continent, country_code, Scenario) %>% 
+  summarise(pmen = mean(Outcome[survey.gender==1]),
+            pwomen = mean(Outcome[survey.gender==0]),
+            pyoung = mean(Outcome[survey.age==0]),
+            pold = mean(Outcome[survey.age==1]),
+            pcollege = mean(Outcome[survey.education==1]),
+            pnocollege = mean(Outcome[survey.education==0]),
+            pcons = mean(Outcome[survey.political==0]),
+            pdem = mean(Outcome[survey.political==1]),
+            prel = mean(Outcome[survey.religious==1]),
+            pnorel = mean(Outcome[survey.religious==0])) %>% 
+  ungroup() %>% 
+  group_by(Continent, country_code, Scenario) %>% 
+  summarize(Men = pwr::ES.h(pmen,pwomen),
+            Older = pwr::ES.h(pold,pyoung),
+            College = pwr::ES.h(pcollege,pnocollege),
+            Progressives = pwr::ES.h(pdem,pcons),
+            Religious = pwr::ES.h(prel,pnorel)) %>% 
+  ungroup() %>% 
+  gather(Trait, Effect, Men:Religious) %>% 
+  mutate(Continent = factor(Continent,
+                            levels = c("Oc.", "Americas", "Europe", "Asia")),
+         Trait = factor(Trait,
+                        levels = c("Men", "College", "Older", "Progressives", "Religious")),
+         country_code = factor(country_code, 
+                               levels = c("AU", "BR", "US", "MX", "CZ", "IT", "DE", "AT", "PL", "BE", "CH", "FR", "RU", "ES", "GB", "NL", "UA", "HK", "TR", "TW", "CN")))
+
+```
+
+```{r demographic effects plot}
+DEM = ggplot(de1, aes(country_code, Effect, fill = Scenario))+
+  geom_hline(yintercept = 0, linetype = "dotted")+
+  geom_point(size = 2.5, shape = 21)+
+  ylim(-1, +1)+
+  labs(title = "Impact of demographic traits on the three scenarios",
+       subtitle = "Cohen's h for the difference in preference",
+       x = "",
+       y = "",
+       caption = "Gender and college are categorical variables, other variables were transformed according to a median split, specific to each country.")+
+ # coord_flip()+
+  facet_grid(Trait~Continent, drop = T, scales = "free_x", space = "free_x")+
+  scale_fill_manual(name = "", values = c("#e1230b","gray", "#e9bb1c"), labels = c("Footbridge", "Loop", "Switch"))+
+  theme_ipsum_rc()
+  
+ggsave(DEM, file = "demographic_traits.png", width = 9, height = 12)
+
+```
+
+
+# Section: Robustness plots
+```{r Carpentry for robustness plots}
+d = read_csv("Shared_data_allResponses.csv") %>% 
+  spread(Scenario, Outcome) %>%
+  group_by(Session_id, country_code, UserID) %>%
+  summarize(Switch = mean(Switch, na.rm = T),
+            Loop = mean(Loop,na.rm = T),
+            Footbridge = mean(Footbridge, na.rm = T)) %>%
+  filter(!is.nan(Loop), !is.nan(Switch), !is.nan(Footbridge)) %>%
+  ungroup() %>%
+ gather(Scenario, Outcome, Switch:Footbridge) %>%
+  mutate(Scenario = factor(Scenario, levels = c("Loop", "Footbridge", "Switch")),
+         Session_id = paste("sn", Session_id, sep = ""))
+
+bigcountries = d %>% 
+  group_by(country_code, Scenario) %>% 
+  summarize(sample = n()) %>% 
+  filter(sample > 199) %>% 
+  distinct(country_code) %>% 
+  pull()
+  
+d = d %>% filter(country_code %in% bigcountries)
+```
+
+## Fig. S3: Device used: Desktop, Mobile
+```{r data carpentry for SI plot}
+mydata = read_csv("Shared_data_allResponses.csv")
+d_SI_Tmp = mydata %>%  
+  mutate(Continent = countrycode(sourcevar = country_code,
+                            origin = "iso2c",
+                            destination = "continent"),
+         Continent = factor(Continent,
+                            levels = c("Oceania", "Americas", "Europe", "Asia"),
+                            labels = c("Oc.", "Americas", "Europe", "Asia")),
+         Scenario_order = factor(Scenario_order,
+                                 levels = c("1", "2", "3"),
+                                 labels = c("First", "Second", "Third")),
+         Scenario = factor(Scenario,
+                           labels = c( "Footbridge", "Loop", "Switch"))) %>% 
+  group_by(country_code, Continent, Template, Scenario) %>% 
+  summarize(Acceptance = mean(Outcome),
+            se = sciplot::se(Outcome),
+            N = n()) %>% 
+  filter(country_code %in% bigcountries) %>% 
+  na.omit() 
+
+
+```
+
+```{r SI plot}
+
+SI_Tmp <- 
+  ggplot(d_SI_Tmp, aes(x = reorder(country_code, -Acceptance), Acceptance, color = Template, group = country_code))+
+    geom_hline(aes(yintercept = .5), linetype = "dotted")+
+  geom_pointrange(aes(ymin = Acceptance - 1.96*se, ymax=Acceptance + 1.96*se,y=Acceptance), 
+                    position=position_dodge2(.9), size=1, fatten=0.5)+
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1.2))+
+  labs(title = '',
+       x = "",
+       y = ""
+     )+
+  facet_grid(Scenario~Continent, drop = T, scales = "free_x", space = "free_x")+
+  theme_ipsum_rc()+
+  scale_color_manual(name = "Device", values = c("#b35806","#fdb863"))+
+  theme(axis.text.x = element_text(size = 7),
+        axis.text.y = element_text(size = 8),
+        aspect.ratio = 7/1,
+        legend.position = c("right"))
+  
+
+ggsave(SI_Tmp, file = "SI_Robustness_Template.png", width = 12)
+```
+
+## Fig. S4: Language: English, Native Language, Other
+```{r data carpentry for SI plot}
+ourLangs <- c("ar", "de", "en", "es", "fr", "ja", "kr", "pt", "ru", "zh")
+countrylangs = read_csv("official-language.csv")
+
+countrylangs <- countrylangs[countrylangs$language %in% ourLangs,]
+isNative <- function(c,l){return(l %in% with(countrylangs,language[countrycode(countrylangs$country,"iso3c","iso2c") == c]))}
+
+mydata$NativeLanguage <- mapply(isNative,c=mydata$country_code,l=mydata$lang)
+```
+
+
+```{r data carpentry for SI plot}
+d_SI_ENL = mydata %>%  
+  mutate(Continent = countrycode(sourcevar = country_code,
+                            origin = "iso2c",
+                            destination = "continent"),
+         Continent = factor(Continent,
+                            levels = c("Oceania", "Americas", "Europe", "Asia"),
+                            labels = c("Oc.", "Americas", "Europe", "Asia")),
+         Scenario_order = factor(Scenario_order,
+                                 levels = c("1", "2", "3"),
+                                 labels = c("First", "Second", "Third")),
+         English_language = lang=="en",
+         English_Native_language = factor(ifelse(NativeLanguage,TRUE,paste0(NativeLanguage,"|",English_language)),
+                               levels = c("TRUE","FALSE|TRUE","FALSE|FALSE"),
+                               labels = c("Native Speaker","Non-Native English","Non-Native Other")),
+         Scenario = factor(Scenario,
+                           labels = c( "Footbridge", "Loop", "Switch"))) %>% 
+  group_by(country_code, Continent, English_Native_language, Scenario) %>% 
+  summarize(Acceptance = mean(Outcome),
+            se = sciplot::se(Outcome),
+            N = n()) %>% 
+  filter(country_code %in% bigcountries) %>% 
+  na.omit() 
+
+
+```
+
+```{r SI plot}
+
+SI_ENL <- 
+  ggplot(d_SI_ENL, aes(x = reorder(country_code, -Acceptance), Acceptance, color = English_Native_language, group = country_code))+
+    geom_hline(aes(yintercept = .5), linetype = "dotted")+
+  geom_pointrange(aes(ymin = Acceptance - 1.96*se, ymax=Acceptance + 1.96*se,y=Acceptance), 
+                    position=position_dodge2(.9), size=1, fatten=0.5)+
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(-0.4, 1.4))+
+  labs(title = '',
+       x = "",
+       y = ""
+     )+
+  facet_grid(Scenario~Continent, drop = T, scales = "free_x", space = "free_x")+
+  theme_ipsum_rc()+
+  scale_color_manual(name = "Langugae Used", values = c("#b35806","#e08214", "#fdb863"))+
+  theme(axis.text.x = element_text(size = 7),
+        axis.text.y = element_text(size = 8),
+        aspect.ratio = 7/1,
+        legend.position = c("right"))
+
+ggsave(SI_ENL, file = "SI_Robustness_ENL.png", width = 12)
+```
+
+## Fig. S5: Classic Mode Order: Before MM, After MM
+```{r data carpentry for SI plot}
+d_SI_MM = mydata %>%  
+  mutate(Continent = countrycode(sourcevar = country_code,
+                            origin = "iso2c",
+                            destination = "continent"),
+         Continent = factor(Continent,
+                            levels = c("Oceania", "Americas", "Europe", "Asia"),
+                            labels = c("Oc.", "Americas", "Europe", "Asia")),
+         Scenario_order = factor(Scenario_order,
+                                 levels = c("1", "2", "3"),
+                                 labels = c("First", "Second", "Third")),
+         ClassicMode_order = factor(seenOther,
+                               levels = c(FALSE,TRUE),
+                               labels = c("Before MM","After MM")),
+         Scenario = factor(Scenario,
+                           labels = c( "Footbridge", "Loop", "Switch"))) %>% 
+  group_by(country_code, Continent, ClassicMode_order, Scenario) %>% 
+  summarize(Acceptance = mean(Outcome),
+            se = sciplot::se(Outcome),
+            N = n()) %>% 
+  filter(country_code %in% bigcountries) %>% 
+  na.omit() 
+
+
+```
+
+```{r SI plot}
+
+SI_MM <- 
+  ggplot(d_SI_MM, aes(x = reorder(country_code, -Acceptance), Acceptance, color = ClassicMode_order, group = country_code))+
+    geom_hline(aes(yintercept = .5), linetype = "dotted")+
+  geom_pointrange(aes(ymin = Acceptance - 1.96*se, ymax=Acceptance + 1.96*se,y=Acceptance), 
+                    position=position_dodge2(.9), size=1, fatten=0.5)+
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0.19, 1))+
+  labs(title = '',
+       x = "",
+       y = ""
+     )+
+  facet_grid(Scenario~Continent, drop = T, scales = "free_x", space = "free_x")+
+  theme_ipsum_rc()+
+  scale_color_manual(name = "Classic Mode Order", values = c("#b35806","#fdb863"))+
+  theme(axis.text.x = element_text(size = 7),
+        axis.text.y = element_text(size = 8),
+        aspect.ratio = 7/1,
+        legend.position = c("right"))
+
+ggsave(SI_MM, file = "SI_Robustness_MM.png", width = 12)
+```
+
+
+## Fig. S6: Scenario Order: First, Second, Third
+```{r data carpentry for main plot}
+mydata = read_csv("Shared_data_allResponses.csv")
+d_SI_SO = mydata %>%  
+  mutate(Continent = countrycode(sourcevar = country_code,
+                            origin = "iso2c",
+                            destination = "continent"),
+         Continent = factor(Continent,
+                            levels = c("Oceania", "Americas", "Europe", "Asia"),
+                            labels = c("Oc.", "Americas", "Europe", "Asia")),
+         Scenario_order = factor(Scenario_order,
+                                 levels = c("1", "2", "3"),
+                                 labels = c("First", "Second", "Third")),
+         Scenario = factor(Scenario,
+                           labels = c( "Footbridge", "Loop", "Switch"))) %>% 
+  group_by(country_code, Continent, Scenario_order, Scenario) %>% 
+  summarize(Acceptance = mean(Outcome),
+            se = sciplot::se(Outcome),
+            N = n()) %>% 
+  filter(country_code %in% bigcountries) %>% 
+  na.omit() 
+
+
+```
+```{r SI plot}
+
+SI_SO <- 
+  ggplot(d_SI_SO, aes(x = reorder(country_code, -Acceptance), Acceptance, color = Scenario_order, group = country_code))+
+    geom_hline(aes(yintercept = .5), linetype = "dotted")+
+  geom_pointrange(aes(ymin = Acceptance - 1.96*se, ymax=Acceptance + 1.96*se,y=Acceptance), 
+                    position=position_dodge2(.9), size=1,fatten=0.5)+
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0.2, 1))+
+  labs(title = '',
+       x = "",
+       y = ""
+     )+
+  facet_grid(Scenario~Continent, drop = T, scales = "free_x", space = "free_x")+
+  theme_ipsum_rc()+
+  scale_color_manual(name = "Presentation Order", values = c("#b35806","#e08214", "#fdb863"))+
+  theme(axis.text.x = element_text(size = 7),
+        axis.text.y = element_text(size = 8),
+        aspect.ratio = 7/1,
+        legend.position = c("right"))
+  
+
+ggsave(SI_SO, file = "SI_Robustness_ScenarioOrder.png", width = 12)
+```
+
+
+## Fig. S7: Sacrificing is: Left vs. Right
+```{r data carpentry for SI plot}
+d_SI_LR = mydata %>%  
+  mutate(Continent = countrycode(sourcevar = country_code,
+                            origin = "iso2c",
+                            destination = "continent"),
+         Continent = factor(Continent,
+                            levels = c("Oceania", "Americas", "Europe", "Asia"),
+                            labels = c("Oc.", "Americas", "Europe", "Asia")),
+         Scenario_order = factor(Scenario_order,
+                                 levels = c("1", "2", "3"),
+                                 labels = c("First", "Second", "Third")),
+         Sacrificing_is = factor(answerLeft==Outcome,
+                               levels = c(FALSE,TRUE),
+                               labels = c("Right","Left")),
+         Scenario = factor(Scenario,
+                           labels = c( "Footbridge", "Loop", "Switch"))) %>% 
+  group_by(country_code, Continent, Sacrificing_is, Scenario) %>% 
+  summarize(Acceptance = mean(Outcome),
+            se = sciplot::se(Outcome),
+            N = n()) %>% 
+  filter(country_code %in% bigcountries) %>% 
+  na.omit() 
+
+
+```
+
+```{r SI plot}
+
+SI_LR <- 
+  ggplot(d_SI_LR, aes(x = reorder(country_code, -Acceptance), Acceptance, color = Sacrificing_is, group = country_code))+
+    geom_hline(aes(yintercept = .5), linetype = "dotted")+
+  geom_pointrange(aes(ymin = Acceptance - 1.96*se, ymax=Acceptance + 1.96*se,y=Acceptance), 
+                    position=position_dodge2(.9), size=1, fatten=0.5)+
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0.19, 1))+
+  labs(title = '',
+       x = "",
+       y = ""
+     )+
+  facet_grid(Scenario~Continent, drop = T, scales = "free_x", space = "free_x")+
+  theme_ipsum_rc()+
+  scale_color_manual(name = "Sacrificing is", values = c("#b35806","#fdb863"))+
+  theme(axis.text.x = element_text(size = 7),
+        axis.text.y = element_text(size = 8),
+        aspect.ratio = 7/1,
+        legend.position = c("right"))
+
+ggsave(SI_LR, file = "SI_Robustness_LR.png", width = 12)
+```
+
+## Fig. S8: Survey taking (survey takers vs. other participants)
+
+```{r}
+
+load(file = "surveyvsnosurvey.rdata")
+
+co = dc %>% 
+  group_by(Scenario) %>% 
+  summarize(cor(Survey, NoSurvey)) %>% 
+  ungroup() %>% 
+  rename(corr = 'cor(Survey, NoSurvey)') %>% 
+  mutate(corr = paste0("r = ",round(corr, 2)))
+
+SI_SN <- ggplot(dc, aes(Survey, NoSurvey, color = Continent, label = country_code))+
+  geom_abline(intercept = 0, slope = 1, linetype = "dotted", color = "black")+
+  geom_point(size = 1)+
+  geom_text(data = co, aes(label = corr), color = "black", x = .4, y = .85, family = "Roboto Condensed", size =4)+
+  xlim(.3,.91)+
+  ylim(.3,.91)+
+  labs(x = "Proportion choosing sacrifice among survey takers",
+       y = "Among other participants")+
+  facet_wrap(~Scenario, ncol = 3)+
+  scale_color_ipsum(name = "")+
+  theme_ipsum_rc()+
+  theme(aspect.ratio = 1)
+
+ggsave(SI_SN, file = "ComparisonSurveyTakersVsOthers.png", width = 8, height = 4)
+```
+
+# Section: Country-level Correlations
+## Fig. S9: Correlation matrix
+
+```{r Import Data}
+load(file = "Data_for_correlation_matrix.rdata")
+gg.cor <- ggcorr(dcs, 
+         low = "steelblue", 
+         mid = "white", 
+         high = "darkred", 
+         label = "true", 
+         label_size = 3, hjust = .84, 
+         layout.exp = 1,
+         size = 4,
+         family = "Roboto Condensed",
+         legend.position = "none")
+
+ggsave(gg.cor, file = "correlation_matrix.png", width = 6)
+
+```
+
+# Figure S10: Correlation with measure of support for military targeting of civilians
+
+```{r}
+
+load(file = "data.figure.military.SI.rdata")
+
+MILITARY = ggplot(dcm, aes(Military_on_civilians_Justified/100, Footbridge))+
+  geom_smooth(method = "lm", color = "black", fill = "grey90", size = .5, linetype = "dotted")+
+  geom_point(aes(color = Continent), size = 1.5)+
+  geom_text_repel(aes(label = two_letter_code, color = Continent), show.legend = F, size = 2.5, family = "Roboto Condensed")+
+  labs(y = "Proportion taking action in Footbridge",
+      x = "Proportion saying that military to target and kill civilians is sometimes justified\nGallup 2008-2010")+
+  scale_color_ipsum(name = "")+
+  theme_ipsum_rc()+
+  theme(aspect.ratio = 1/1,
+        axis.line = element_line(color = "black", size = .25),
+        panel.grid = element_line(color = "gray99"),
+        legend.position = "top",
+        legend.justification='left',
+        legend.direction='horizontal')
+
+ggsave(MILITARY, file = "Military_figure_SI.png", width = 6)
+
+```

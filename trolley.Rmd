@@ -1,0 +1,1029 @@
+---
+title: "Moral Machine (Trolley Problem) - Re-Analysis"
+author: Scott Claessens
+date: "`r format(Sys.Date())`"
+bibliography: refs/refs.bib
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    number_sections: false
+    toc_float: true
+---
+
+<style>
+pre {
+  overflow-x: auto;
+}
+pre code {
+  word-wrap: normal;
+  white-space: pre;
+}
+</style>
+
+```{r setup, echo=F, cache=F}
+options(width = 999)
+```
+
+# 1. Introduction
+
+The purpose of this document is to re-analyse the data for @Awad2020 published in PNAS. We thank the authors for making their data publicly available for re-analysis.
+
+In the paper, the authors run country-level regressions showing that relational mobility (a country-level variable measuring "the fluidity with which people can develop new relationships") predicts the probability of acting in three variations of the trolley problem. They conduct this key analysis in the following way:
+
+```{r previous analysis, warning=F, message=F}
+library(tidyverse)
+library(countrycode)
+
+# load the country-level dataset
+load("osf_mxa6z/countrylevelregressions.rdata")
+
+# trim the country-level dataset
+dd <- 
+  ddl %>% 
+  mutate(Continent = 
+           countrycode(sourcevar = two_letter_code, 
+                       origin = "iso2c", 
+                       destination = "continent"),
+         Continent = factor(
+           Continent, levels = c("Europe", "Americas", 
+                                 "Asia", "Oceania"))) %>%
+  filter(!is.na(Continent))
+
+# run regression without controls (Switch only, for an example)
+fit <- lm(Switch ~ RML, data = dd)
+summary(fit)
+```
+
+Indeed, we find a positive association between relational mobility in a country `RML` and the proportion of individuals in that country choosing to act in the Switch version of the trolley problem.
+
+However, this analysis has some methodological flaws:
+
+1. It uses a reduced country-level dataset (only 23 countries are analysed) as opposed to leveraging the statistical power of the full individual-level dataset using multi-level regression.
+2. It treats the outcome variable as Gaussian, when in fact it is a country-level proportion.
+3. It does not account for the non-independence of countries that arise due to shared cultural ancestry and geographic proximity (Galton's problem).
+4. It does not account for measurement error on the relational mobility variable, which is actually an estimated latent variable from a confirmatory factor analysis and so has standard errors. I found these standard errors from [this model output on OSF](https://osf.io/e679h/).
+
+We would like to see if the analysis reported by the authors is robust to these violations. To do this, we conduct Bayesian multi-level logistic regression in R using the [brms package](https://github.com/paul-buerkner/brms) [@Burkner2017].
+
+```{r cleanup, echo=F}
+rm(ddl, fit)
+```
+
+# 2. Load data
+
+## 2.1. Trolley data
+
+First, load the individual-level data.
+
+```{r load data}
+d <- read.csv("osf_mxa6z/Shared_data_allResponses.csv", na.strings = NULL)
+```
+
+Add country-level data on relational mobility from @Thomson2018 (see [here](https://osf.io/qfbjc/) and [here](http://relationalmobility.org/) for more information about these values) and filter to only include countries with relational mobility data.
+
+```{r add RM, warning=F, message=F}
+d <- d %>% inner_join(read.csv("data/rm.csv"), by = "country_code")
+```
+
+This dataset contains information on `r nrow(d)` decisions from `r length(unique(d$UserID))` individuals across `r length(unique(d$country_code))` countries. Interestingly, we have data for more countries than the analysis above, which only included 23 countries. Our dataset has information for Egypt, South Korea, Libya, etc. which were not included in the published analyses, presumably because they were beneath the "lower bound of 200 responses per scenario and country" [@Awad2020, page 1]. The advantage of using multi-level modelling is that arbitrary cutoffs like this are not necessary: countries with smaller sample sizes will be estimated with more uncertainty and be pulled more towards the grand mean via pooling (see @McElreath2016 for more information).
+
+## 2.2. Distance matrices
+
+Load covariance matrices for geographic and linguistic distance between countries.
+
+```{r covariance matrices, warning=F, message=F, echo=F, eval=F}
+library(geoR)
+
+### CREATE GEOGRAPHIC COVARIANCE MATRIX
+
+# load proximity matrix
+geoDist <- as.matrix(read.csv("data/1D Population Proximity.csv", row.names = 1, na.strings = NULL))
+# convert to distance
+geoDist <- 1 - geoDist
+diag(geoDist) <- 0
+# retain only countries in d
+geoDist <- geoDist[rownames(geoDist) %in% d$country_code,
+                   colnames(geoDist) %in% d$country_code]
+# from distance to covariance
+A_geo <- varcov.spatial(dists.lowertri = geoDist[lower.tri(geoDist)], cov.pars = c(1, 0.5))$varcov
+# give A_geo row and col names
+rownames(A_geo) <- colnames(A_geo) <- colnames(geoDist)
+# save
+save(A_geo, file = "data/A_geo.rda")
+# cleanup
+rm(geoDist, A_geo)
+
+### CREATE LINGUISTIC COVARIANCE MATRIX
+
+# load proximity matrix
+lingDist <- as.matrix(read.csv("data/2D Country Proximity 1pml adj.csv", row.names = 1, na.strings = NULL))
+# convert to distance
+lingDist <- 1 - lingDist
+diag(lingDist) <- 0
+# retain only countries in d
+lingDist <- lingDist[rownames(lingDist) %in% d$country_code,
+                     colnames(lingDist) %in% d$country_code]
+# from distance to covariance
+A_ling <- varcov.spatial(dists.lowertri = lingDist[lower.tri(lingDist)], cov.pars = c(1, 0.5))$varcov
+# give A_geo row and col names
+rownames(A_ling) <- colnames(A_ling) <- colnames(lingDist)
+# save
+save(A_ling, file = "data/A_ling.rda")
+# cleanup
+rm(lingDist, A_ling)
+```
+
+```{r load matrices, eval=F}
+load("data/A_geo.rda")
+load("data/A_ling.rda")
+```
+
+These covariance matrices are created for the `r length(unique(d$country_code))` countries in the full dataset, based on geographic and linguistic distance between countries. We do not directly code the creation of the distance matrices in this Markdown document, but briefly outline the methods used to create them here:
+
+Geographic distance between two countries was calculated as the geodesic distance between country capital cities, using the R packages [maps](https://cran.r-project.org/web/packages/maps/index.html) [@Brownrigg2018] and [geosphere](https://cran.r-project.org/web/packages/geosphere/index.html) [@Hijmans2017]. 
+
+Linguistic distance between two countries was calculated as the cultural proximity between all languages spoken within those countries, weighted by speaker percentages. We acquired cultural proximity data by combining the language family trees provided by [Glottolog v3.0](https://glottolog.org/) [@glottolog] into one global language tree (undated and unresolved), and then calculated cultural proximity $s$ between two languages $j$ and $k$ as the distance (in number of nodes traversed) of their most recent common ancestor $i$ to the root of the tree, through the following formula:
+
+$$s_{jk} = \frac{n_r-n_i}{n_r}$$ 
+
+where $n_r$ is the maximum path length (in number of nodes traversed) leading to the pan-human root and $n_i$ is the maximum path length leading to node. We then combined these proximities with speaker data from [Ethnologue 21](https://www.ethnologue.com/ethnoblog/gary-simons/welcome-21st-edition) [@Eberhard2018] and compared every language spoken within those countries by at least 1 permille of the population, weighted by speaker percentages, through the following formula:
+
+$$w_{lm} = \Sigma \Sigma p_{lj} p_{mk} s_{jk}$$ 
+
+where $p_{lj}$ is the percentage of the population in nation $l$ speaking language $j$, $p_{mk}$ is the percentage of the population in nation $m$ speaking language $k$, and $s_{jk}$ is the proximity measure between languages $j$ and $k$ [@Eff2008].
+
+# 3. Fit Bayesian multi-level logistic regressions
+
+We will use brms to fit the models.
+
+```{r load brms, warning=F, message=F}
+library(brms)
+```
+
+We use `Outcome` as the binary response variable, and predict the probability of the outcome (sacrificing in the trolley problem) with (1) the scenario type `Scenario`, (2) country-level relational mobility `RML`, and (3) the interaction between these. We also include random intercepts for `UserID`, and allow further random intercepts for `country_code` and `country_code2` (an identical variable) to covary according to our linguistic and geographic covariance matrices.
+
+```{r create country_code2}
+# country_code as factor
+d$country_code <- factor(d$country_code)
+
+# identical variable for covariance matrices
+d$country_code2 <- d$country_code
+```
+
+Before this, we run a simple model without any interaction with `RML`.
+
+```{r run model 1, eval=F}
+m1 <- brm(Outcome ~ 0 + intercept + Scenario + 
+            (0 + intercept | country_code) + 
+            (0 + intercept | country_code2) + 
+            (0 + intercept | UserID),
+          cov_ranef = list(country_code  = A_ling,
+                           country_code2 = A_geo),
+          data = d, family = bernoulli,
+          prior = c(prior(normal(0, 0.5), class = b),
+                    prior(student_t(3, 0, 1), class = sd)),
+          iter = 4000, warmup = 2000, cores = 4, chains = 4,
+          control = list(adapt_delta = 0.99, max_treedepth = 15),
+          seed = 2113)
+
+save(m1, file = "models/m1.rda")
+```
+
+We then add the interaction with `RML` (without measurement error).
+
+```{r run model 2, eval=F}
+m2 <- brm(Outcome ~ 0 + intercept + Scenario*RML + 
+            (0 + intercept | country_code) + 
+            (0 + intercept | country_code2) + 
+            (0 + intercept | UserID),
+          cov_ranef = list(country_code  = A_ling,
+                           country_code2 = A_geo),
+          data = d, family = bernoulli,
+          prior = c(prior(normal(0, 0.5), class = b),
+                    prior(student_t(3, 0, 1), class = sd)),
+          iter = 4000, warmup = 2000, cores = 4, chains = 4,
+          control = list(adapt_delta = 0.99, max_treedepth = 15),
+          inits = 0, seed = 2113)
+
+save(m2, file = "models/m2.rda")
+```
+
+We then add measurement error to `RML`. Initially, we used the same priors as the previous model for `m3`, but it consistently resulted in a multimodal posterior, which is difficult to interpret. In an attempt to avoid this, we set the priors based on the posterior distribution from `m2`, a technique known as posterior passing. Because there is so much data (182780 data points), these priors will be overwhelmed by the data anyway - they are just to get the model sampling on track.
+
+```{r run model 3, eval=F}
+m3 <- brm(Outcome ~ 0 + intercept + Scenario*me(x = RML, sdx = RML_SE, gr = country_code) + 
+           (0 + intercept | country_code) + 
+           (0 + intercept | country_code2) + 
+           (0 + intercept | UserID),
+          cov_ranef = list(country_code  = A_ling,
+                           country_code2 = A_geo),
+          data = d, family = bernoulli,
+          # use approximated priors from m2 posterior to help model converge
+          prior = c(prior(normal(0.10,  0.13), class = b, coef = "intercept"),
+                    prior(normal(1.22,  0.02), class = b, coef = "ScenarioLoop"),
+                    prior(normal(1.89,  0.02), class = b, coef = "ScenarioSwitch"),
+                    prior(normal(0.73,  0.27), class = b, 
+                          coef = "mexEQRMLsdxEQRML_SEgrEQcountry_code"),
+                    prior(normal(-0.31, 0.11), class = b, 
+                          coef = "mexEQRMLsdxEQRML_SEgrEQcountry_code:ScenarioLoop"),
+                    prior(normal(-0.06, 0.11), class = b, 
+                          coef = "mexEQRMLsdxEQRML_SEgrEQcountry_code:ScenarioSwitch"),
+                    prior(student_t(3, 0.25, 0.08), class = sd, 
+                          coef = "intercept", group = "country_code"),
+                    prior(student_t(3, 0.12, 0.08), class = sd, 
+                          coef = "intercept", group = "country_code2"),
+                    prior(normal(1.62, 0.01), class = sd, 
+                          coef = "intercept", group = "UserID")),
+          iter = 4000, warmup = 2000, cores = 4, chains = 4,
+          control = list(adapt_delta = 0.99, max_treedepth = 15),
+          save_mevars = TRUE, seed = 2113)
+
+save(m3, file = "models/m3.rda")
+```
+
+We also add GDP, individualism, and religiosity as control variables. We use listwise deletion as a default, following the original paper.
+
+```{r add controls to data, warning=F, message=F}
+controls <- dd %>% select(two_letter_code, GDP_log10, Individualism, Religion_is_very_important)
+d <- d %>% left_join(controls, by = c("country_code" = "two_letter_code"))
+rm(controls)
+
+# centre predictors
+d$GDP_log10 <- d$GDP_log10 - mean(d$GDP_log10, na.rm=T)
+d$Individualism <- d$Individualism - mean(d$Individualism, na.rm=T)
+d$Religion_is_very_important <- d$Religion_is_very_important - mean(d$Religion_is_very_important, na.rm=T)
+```
+
+```{r run model 4, eval=F}
+# control for GDP
+m4 <- brm(Outcome ~ 0 + intercept + Scenario*me(x = RML, sdx = RML_SE, gr = country_code) + 
+            Scenario:GDP_log10 +
+            (0 + intercept | country_code) + 
+            (0 + intercept | country_code2) + 
+            (0 + intercept | UserID),
+          cov_ranef = list(country_code  = A_ling,
+                           country_code2 = A_geo),
+          data = d, family = bernoulli,
+          # use approximated priors from m2 posterior to help model converge
+          prior = c(prior(normal(0.10,  0.13), class = b, coef = "intercept"),
+                    prior(normal(1.22,  0.02), class = b, coef = "ScenarioLoop"),
+                    prior(normal(1.89,  0.02), class = b, coef = "ScenarioSwitch"),
+                    prior(normal(0.73,  0.27), class = b, 
+                          coef = "mexEQRMLsdxEQRML_SEgrEQcountry_code"),
+                    prior(normal(-0.31, 0.11), class = b, 
+                          coef = "mexEQRMLsdxEQRML_SEgrEQcountry_code:ScenarioLoop"),
+                    prior(normal(-0.06, 0.11), class = b, 
+                          coef = "mexEQRMLsdxEQRML_SEgrEQcountry_code:ScenarioSwitch"),
+                    prior(student_t(3, 0.25, 0.08), class = sd, 
+                          coef = "intercept", group = "country_code"),
+                    prior(student_t(3, 0.12, 0.08), class = sd, 
+                          coef = "intercept", group = "country_code2"),
+                    prior(normal(1.62, 0.01), class = sd, 
+                          coef = "intercept", group = "UserID"),
+                    # add new priors for control
+                    prior(normal(0, 0.5), class = b, coef = "ScenarioSwitch:GDP_log10"),
+                    prior(normal(0, 0.5), class = b, coef = "ScenarioLoop:GDP_log10"),
+                    prior(normal(0, 0.5), class = b, coef = "ScenarioFootbridge:GDP_log10")),
+          iter = 4000, warmup = 2000, cores = 4, chains = 4,
+          control = list(adapt_delta = 0.99, max_treedepth = 15),
+          save_mevars = TRUE, seed = 2113)
+
+save(m4, file = "models/m4.rda")
+```
+
+```{r run model 5, eval=F}
+# control for Individualism
+m5 <- brm(Outcome ~ 0 + intercept + Scenario*me(x = RML, sdx = RML_SE, gr = country_code) + 
+            Scenario:Individualism +
+            (0 + intercept | country_code) + 
+            (0 + intercept | country_code2) + 
+            (0 + intercept | UserID),
+          cov_ranef = list(country_code  = A_ling,
+                           country_code2 = A_geo),
+          data = d, family = bernoulli,
+          # use approximated priors from m2 posterior to help model converge
+          prior = c(prior(normal(0.10,  0.13), class = b, coef = "intercept"),
+                    prior(normal(1.22,  0.02), class = b, coef = "ScenarioLoop"),
+                    prior(normal(1.89,  0.02), class = b, coef = "ScenarioSwitch"),
+                    prior(normal(0.73,  0.27), class = b, 
+                          coef = "mexEQRMLsdxEQRML_SEgrEQcountry_code"),
+                    prior(normal(-0.31, 0.11), class = b, 
+                          coef = "mexEQRMLsdxEQRML_SEgrEQcountry_code:ScenarioLoop"),
+                    prior(normal(-0.06, 0.11), class = b, 
+                          coef = "mexEQRMLsdxEQRML_SEgrEQcountry_code:ScenarioSwitch"),
+                    prior(student_t(3, 0.25, 0.08), class = sd, 
+                          coef = "intercept", group = "country_code"),
+                    prior(student_t(3, 0.12, 0.08), class = sd, 
+                          coef = "intercept", group = "country_code2"),
+                    prior(normal(1.62, 0.01), class = sd, 
+                          coef = "intercept", group = "UserID"),
+                    # add new priors for control
+                    prior(normal(0, 0.5), class = b, coef = "ScenarioSwitch:Individualism"),
+                    prior(normal(0, 0.5), class = b, coef = "ScenarioLoop:Individualism"),
+                    prior(normal(0, 0.5), class = b, coef = "ScenarioFootbridge:Individualism")),
+          iter = 4000, warmup = 2000, cores = 4, chains = 4,
+          control = list(adapt_delta = 0.99, max_treedepth = 15),
+          save_mevars = TRUE, seed = 2113)
+
+save(m5, file = "models/m5.rda")
+```
+
+```{r run model 6, eval=F}
+# control for religiosity
+m6 <- brm(Outcome ~ 0 + intercept + Scenario*me(x = RML, sdx = RML_SE, gr = country_code) + 
+            Scenario:Religion_is_very_important +
+            (0 + intercept | country_code) + 
+            (0 + intercept | country_code2) + 
+            (0 + intercept | UserID),
+          cov_ranef = list(country_code  = A_ling,
+                           country_code2 = A_geo),
+          data = d, family = bernoulli,
+          # use approximated priors from m2 posterior to help model converge
+          prior = c(prior(normal(0.10,  0.13), class = b, coef = "intercept"),
+                    prior(normal(1.22,  0.02), class = b, coef = "ScenarioLoop"),
+                    prior(normal(1.89,  0.02), class = b, coef = "ScenarioSwitch"),
+                    prior(normal(0.73,  0.27), class = b, 
+                          coef = "mexEQRMLsdxEQRML_SEgrEQcountry_code"),
+                    prior(normal(-0.31, 0.11), class = b, 
+                          coef = "mexEQRMLsdxEQRML_SEgrEQcountry_code:ScenarioLoop"),
+                    prior(normal(-0.06, 0.11), class = b, 
+                          coef = "mexEQRMLsdxEQRML_SEgrEQcountry_code:ScenarioSwitch"),
+                    prior(student_t(3, 0.25, 0.08), class = sd, 
+                          coef = "intercept", group = "country_code"),
+                    prior(student_t(3, 0.12, 0.08), class = sd, 
+                          coef = "intercept", group = "country_code2"),
+                    prior(normal(1.62, 0.01), class = sd, 
+                          coef = "intercept", group = "UserID"),
+                    # add new priors for control
+                    prior(normal(0, 0.5), class = b, 
+                          coef = "ScenarioSwitch:Religion_is_very_important"),
+                    prior(normal(0, 0.5), class = b, 
+                          coef = "ScenarioLoop:Religion_is_very_important"),
+                    prior(normal(0, 0.5), class = b, 
+                          coef = "ScenarioFootbridge:Religion_is_very_important")),
+          iter = 4000, warmup = 2000, cores = 4, chains = 4,
+          control = list(adapt_delta = 0.99, max_treedepth = 15),
+          save_mevars = TRUE, seed = 2113)
+
+save(m6, file = "models/m6.rda")
+```
+
+Finally, fit models with just Asian countries.
+
+```{r Asian subset}
+d_Asia <-
+  d %>%
+  mutate(
+    Continent = 
+      countrycode(sourcevar = country_code, 
+                  origin = "iso2c", destination = "continent"),
+    Continent = 
+      factor(Continent, levels = c("Europe", "Americas", 
+                                   "Asia", "Oceania", "Africa"))) %>%
+  filter(Continent == "Asia")
+```
+
+```{r run model 7, eval=F}
+m7 <- brm(Outcome ~ 0 + intercept + Scenario*RML + 
+            (0 + intercept | country_code) + 
+            (0 + intercept | country_code2) + 
+            (0 + intercept | UserID),
+          cov_ranef = list(country_code  = A_ling,
+                           country_code2 = A_geo),
+          data = d_Asia, family = bernoulli,
+          prior = c(prior(normal(0, 0.5), class = b),
+                    prior(student_t(3, 0, 1), class = sd)),
+          iter = 4000, warmup = 2000, cores = 4, chains = 4,
+          control = list(adapt_delta = 0.99, max_treedepth = 15),
+          save_mevars = TRUE, seed = 2113)
+
+save(m7, file = "models/m7.rda")
+```
+
+```{r run model 8, eval=F}
+m8 <- brm(Outcome ~ 0 + intercept + Scenario*me(x = RML, sdx = RML_SE, gr = country_code) + 
+            (0 + intercept | country_code) + 
+            (0 + intercept | country_code2) + 
+            (0 + intercept | UserID),
+          cov_ranef = list(country_code  = A_ling,
+                           country_code2 = A_geo),
+          data = d_Asia, family = bernoulli,
+          # use approximated priors from m7 to help the model converge
+          prior = c(prior(normal(0.05,  0.26), class = b, coef = "intercept"),
+                    prior(normal(1.01,  0.07), class = b, coef = "ScenarioLoop"),
+                    prior(normal(1.85,  0.08), class = b, coef = "ScenarioSwitch"),
+                    prior(normal(0.42,  0.47), class = b, 
+                          coef = "mexEQRMLsdxEQRML_SEgrEQcountry_code"),
+                    prior(normal(-0.99, 0.27), class = b, 
+                          coef = "mexEQRMLsdxEQRML_SEgrEQcountry_code:ScenarioLoop"),
+                    prior(normal(-0.31, 0.29), class = b, 
+                          coef = "mexEQRMLsdxEQRML_SEgrEQcountry_code:ScenarioSwitch"),
+                    prior(student_t(3, 0.36, 0.22), class = sd, 
+                          coef = "intercept", group = "country_code"),
+                    prior(student_t(3, 0.38, 0.21), class = sd, 
+                          coef = "intercept", group = "country_code2"),
+                    prior(normal(1.82, 0.05), class = sd, 
+                          coef = "intercept", group = "UserID")),
+          iter = 4000, warmup = 2000, cores = 4, chains = 4,
+          control = list(adapt_delta = 0.99, max_treedepth = 15),
+          inits = 0, seed = 2113)
+
+save(m8, file = "models/m8.rda")
+```
+
+```{r load models, echo=F}
+load("models/m1.rda")
+load("models/m2.rda")
+load("models/m3.rda")
+load("models/m4.rda")
+load("models/m5.rda")
+load("models/m6.rda")
+load("models/m7.rda")
+load("models/m8.rda")
+```
+
+# 4. Results
+
+```{r results setup, echo=F, message=F, warning=F}
+library(cowplot)
+
+# for plotting predictions
+plotPredictions <- function(post, controls) {
+  if (controls) {cn <- c(7,8,9)} else {cn <- c(4,5,6)}
+  out <- 
+    tibble(RML = rep(seq(-0.41, 0.36, by = 0.01), each = 8000)) %>%
+    mutate(
+      switch = inv_logit_scaled(post[,1] + post[,3] + (RML * post[,cn[1]]) + (RML * post[,cn[3]])),
+      loop   = inv_logit_scaled(post[,1] + post[,2] + (RML * post[,cn[1]]) + (RML * post[,cn[2]])),
+      foot   = inv_logit_scaled(post[,1] + (RML * post[,cn[1]]))
+      ) %>%
+    group_by(RML) %>%
+    summarise(Switch.median = median(switch),
+              Switch.upper  = quantile(switch, 0.975),
+              Switch.lower  = quantile(switch, 0.025),
+              Loop.median   = median(loop),
+              Loop.upper    = quantile(loop, 0.975),
+              Loop.lower    = quantile(loop, 0.025),
+              Footbridge.median = median(foot),
+              Footbridge.upper  = quantile(foot, 0.975),
+              Footbridge.lower  = quantile(foot, 0.025))
+  return(out)
+}
+
+# for plotting data
+plotData <-
+  d %>%
+  group_by(country_code, Scenario) %>%
+  summarise(
+    RML    = mean(RML),
+    RML_SE = mean(RML_SE),
+    prop   = mean(Outcome)
+    ) %>%
+  mutate(
+    Continent = countrycode(sourcevar = country_code, origin = "iso2c", destination = "continent"),
+    Continent = factor(Continent, levels = c("Europe", "Americas", "Asia", "Oceania", "Africa")),
+    inOriginal = country_code %in% (dd %>% drop_na(RML, Switch) %>% pull(two_letter_code))
+    )
+
+# set theme
+theme_set(theme_classic())
+
+# plotting function
+plotPanel <- function(scenario, post, me, controls, asia) {
+  countriesInModel <- colnames(post)[startsWith(colnames(post),"r_country_code[")] %>% substr(., 16, 17)
+  out <- tibble(sample = 1:nrow(post))
+  for (i in 1:length(countriesInModel)) {
+    countryName <- countriesInModel[i]
+    out <- out %>% mutate(!!countryName := 
+                            post[,"b_intercept"] + 
+                            post[,paste0("r_country_code[", countryName, ",intercept]")] +
+                            post[,paste0("r_country_code2[", countryName, ",intercept]")])
+  }
+  out <- out %>% select(-sample)
+  if (scenario == "Switch") {out <- out %>% mutate_all(function(x) x + post$b_ScenarioSwitch)}
+  if (scenario == "Loop")   {out <- out %>% mutate_all(function(x) x + post$b_ScenarioLoop)}
+  out <-
+    out %>%
+    mutate_all(inv_logit_scaled) %>%
+    gather(country_code, prob) %>%
+    group_by(country_code) %>%
+    summarise(prob.median = median(prob),
+              prob.upper = quantile(prob, 0.975),
+              prob.lower = quantile(prob, 0.025)) %>%
+    left_join(plotData %>% filter(Scenario==scenario), by = "country_code")
+  # asian subset?
+  if (asia) {out <- out %>% filter(Continent == "Asia")}
+  out <- out %>% ggplot()
+  # measurement error around RML?
+  if (me) {out <- out + 
+    geom_errorbarh(aes(y = prob.median, xmin = RML-RML_SE, 
+                       xmax = RML+RML_SE, colour = Continent), size = 0.2, height = 0)}
+  out <- 
+    out +
+    # prob error
+    geom_errorbar(aes(x = RML, ymin = prob.lower, 
+                      ymax = prob.upper, colour = Continent), size = 0.2, width = 0) +
+    # points
+    geom_point(aes(x = RML, y = prob.median, 
+                   colour = Continent), size = 0.65) +
+    # regression shading
+    geom_ribbon(data = plotPredictions(post, controls), 
+                aes(x = RML, ymin = (!!as.name(paste0(scenario, ".lower"))), 
+                    ymax = (!!as.name(paste0(scenario, ".upper")))), fill = "grey", alpha = 0.6) +
+    # regression line
+    geom_line(data = plotPredictions(post, controls), 
+              aes(x = RML, y = (!!as.name(paste0(scenario, ".median"))))) +
+    scale_colour_manual(values = c("#EB7053", "#42D052", "#2E1B3C", "#22A1CF", "grey")) +
+    scale_y_continuous(name = ifelse(scenario == "Switch", "Predicted probability of taking action", ""), 
+                       breaks = seq(0, 1, 0.2), limits = c(0, 1)) +
+    scale_x_continuous(breaks = seq(-0.5, 0.5, by = 0.5), limits = c(-0.5, 0.5)) +
+    ggtitle(scenario) +
+    xlab(ifelse(scenario == "Loop", "Relational mobility", "")) +
+    theme(legend.position = "none",
+          panel.grid.major = element_line(colour = "grey95"),
+          panel.grid.minor = element_line(colour = "grey95"))
+}
+
+# plotting function for original paper
+plotPanelOriginalPaper <- function(scenario) {
+  ggplot(data = plotData %>% filter(Scenario == scenario & inOriginal), aes(x = RML, y = prop)) +
+  geom_point(aes(colour = Continent), size = 0.65) +
+  geom_smooth(method = lm, colour = "black", fill = "grey", alpha = 0.6, size = 0.5) +
+  scale_colour_manual(values = c("#EB7053", "#42D052", "#2E1B3C", "#22A1CF", "grey")) +
+  scale_y_continuous(name = ifelse(scenario == "Switch", "Proportion taking action", ""), 
+                     breaks = seq(0, 1, 0.2), limits = c(0, 1)) +
+  scale_x_continuous(breaks = seq(-0.5, 0.5, by = 0.5), limits = c(-0.5, 0.5)) +
+  ggtitle(scenario) +
+  xlab("") +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(colour = "grey95"),
+        panel.grid.minor = element_line(colour = "grey95"))
+}
+
+# title function
+makeTitle <- function(text) {
+  ggdraw() +
+  draw_label(text, x = 0, hjust = 0) +
+  theme(plot.margin = margin(0, 0, 0, 7))
+}
+```
+
+## 4.1. Controlling for non-independence (intercept-only)
+
+```{r summarise m1}
+summary(m1)
+```
+
+Plot the predictions of `m1`.
+
+```{r plot predictions m1, echo=F, fig.width=6, fig.height=6}
+figS1 <- 
+  plot(marginal_effects(m1), plot = FALSE)$Scenario +
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  scale_y_continuous(name = "Probability of sacrificing", limits = c(0, 1), breaks = seq(0, 1, by = 0.2)) +
+  ggtitle("Predictions from multilevel intercept-only model controlling\nfor country non-independence (no measurement error)")
+
+figS1
+
+# save
+ggsave(figS1, file = "figures/figS1.pdf", width = 6, height = 6)
+ggsave(figS1, file = "figures/figS1.png", width = 6, height = 6)
+```
+
+## 4.2. Controlling for non-independence without measurement error on RML
+
+```{r summarise m2}
+summary(m2)
+```
+
+Plot the predictions of `m2`.
+
+```{r save post2, eval=F, echo=F}
+post2 <- posterior_samples(m2); save(post2, file = "posterior_samples/post2.rda")
+```
+
+```{r plot predictions m2, echo=F}
+load("posterior_samples/post2.rda")
+
+# figS2
+figS2a <- plotPanel("Switch",     post = post2, me = FALSE, controls = FALSE, asia = FALSE)
+figS2b <- plotPanel("Loop",       post = post2, me = FALSE, controls = FALSE, asia = FALSE)
+figS2c <- plotPanel("Footbridge", post = post2, me = FALSE, controls = FALSE, asia = FALSE)
+
+# put together
+legend <- 
+  get_legend(
+    figS2a + 
+      theme(
+        legend.position = "right",
+        legend.title = element_blank(),
+        legend.text = element_text(size = 10)
+        )
+    )
+title <- makeTitle("Predictions from multilevel model controlling for\ncountry non-independence (no measurement error)")
+figS2 <- plot_grid(figS2a, figS2b, figS2c, NULL, legend, nrow = 1, rel_widths = c(1, 1, 1, 0.05, 0.5))
+figS2 <- plot_grid(title, NULL, figS2, ncol = 1, rel_heights = c(0.1, 0.02, 1))
+
+figS2
+
+# save
+ggsave(figS2, file = "figures/figS2.pdf", width = 7, height = 5)
+ggsave(figS2, file = "figures/figS2.png", width = 7, height = 5)
+
+# cleanup
+rm(figS2a, figS2b, figS2c, title)
+```
+
+Calculate slopes for each scenario (on the log-odds scale).
+
+```{r qs, echo=F}
+qs <- c(0.025, 0.5, 0.975)
+```
+
+```{r slope Switch m2}
+# slope of RML in Switch scenario
+slope_switch <- post2$b_RML + post2$`b_ScenarioSwitch:RML`
+quantile(slope_switch, qs) %>% round(2)
+```
+
+```{r slope Loop m2}
+# slope of RML in Loop scenario
+slope_loop <- post2$b_RML + post2$`b_ScenarioLoop:RML`
+quantile(slope_loop, qs) %>% round(2)
+```
+
+```{r slope Footbridge m2}
+# slope of RML in Footbridge scenario
+slope_foot <- post2$b_RML
+quantile(slope_foot, qs) %>% round(2)
+```
+
+The slope remains reliably positive for Switch and Footbridge scenarios, but not Loop.
+
+## 4.3. Controlling for non-independence with measurement error on RML
+
+```{r summarise m3}
+summary(m3)
+```
+
+Plot the predictions of `m3` and compare to the original paper. Panel A refers to the original paper, and Panel B refers to our model (shaded areas denotes 95% credible intervals).
+
+```{r save post3, eval=F, echo=F}
+post3 <- posterior_samples(m3); save(post3, file = "posterior_samples/post3.rda")
+```
+
+```{r plot predictions m3, echo=F, warning=F, message=F, fig.width=8, fig.height=8}
+load("posterior_samples/post3.rda")
+
+# top panel
+fig1top_a <- plotPanelOriginalPaper("Switch")
+fig1top_b <- plotPanelOriginalPaper("Loop")
+fig1top_c <- plotPanelOriginalPaper("Footbridge")
+
+# bottom panel
+fig1bottom_a <- plotPanel("Switch",     post = post3, me = TRUE, controls = FALSE, asia = FALSE)
+fig1bottom_b <- plotPanel("Loop",       post = post3, me = TRUE, controls = FALSE, asia = FALSE)
+fig1bottom_c <- plotPanel("Footbridge", post = post3, me = TRUE, controls = FALSE, asia = FALSE)
+
+# put together
+fig1_top    <- plot_grid(fig1top_a,    fig1top_b,    fig1top_c, nrow = 1)
+fig1_bottom <- plot_grid(fig1bottom_a, fig1bottom_b, fig1bottom_c, nrow = 1)
+fig1        <- plot_grid(fig1_top, NULL, fig1_bottom, ncol = 1, rel_heights = c(1, 0.01, 1), labels = c("A", "", "B"))
+fig1        <- plot_grid(fig1, NULL, legend, rel_widths = c(1, 0.01, 0.15), nrow = 1)
+
+fig1
+
+# save
+ggsave(fig1, file = "figures/fig1.pdf", width = 7, height = 7)
+ggsave(fig1, file = "figures/fig1.png", width = 7, height = 7)
+
+# cleanup
+rm(fig1top_a, fig1top_b, fig1top_c, 
+   fig1bottom_a, fig1bottom_b, fig1bottom_c,
+   fig1_top, fig1_bottom)
+```
+
+Calculate slopes for each scenario (on the log-odds scale).
+
+```{r slope Switch m3}
+# slope of RML in Switch scenario
+slope_switch <- post3$bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code + post3$`bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code:ScenarioSwitch`
+quantile(slope_switch, qs) %>% round(2)
+```
+
+```{r slope Loop m3}
+# slope of RML in Loop scenario
+slope_loop <- post3$bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code + post3$`bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code:ScenarioLoop`
+quantile(slope_loop, qs) %>% round(2)
+```
+
+```{r slope Footbridge m3}
+# slope of RML in Footbridge scenario
+slope_foot <- post3$bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code
+quantile(slope_foot, qs) %>% round(2)
+```
+
+The slope remains reliably positive for Footbridge, but not for Switch or Loop.
+
+## 4.4. Controlling for non-independence with measurement error on RML (plus GDP control)
+
+```{r summarise m4}
+summary(m4)
+```
+
+Plot the predictions of `m4`.
+
+```{r save post4, eval=F, echo=F}
+post4 <- posterior_samples(m4); save(post4, file = "posterior_samples/post4.rda")
+```
+
+```{r plot predictions m4, echo=F}
+load("posterior_samples/post4.rda")
+
+# figS3
+figS3a <- plotPanel("Switch",     post4, me = TRUE, controls = TRUE, asia = FALSE)
+figS3b <- plotPanel("Loop",       post4, me = TRUE, controls = TRUE, asia = FALSE)
+figS3c <- plotPanel("Footbridge", post4, me = TRUE, controls = TRUE, asia = FALSE)
+
+# put together
+title <- makeTitle("Predictions from multilevel model controlling for country\nnon-independence, measurement error, and GDP")
+figS3 <- plot_grid(figS3a, figS3b, figS3c, NULL, legend, nrow = 1, rel_widths = c(1, 1, 1, 0.05, 0.5))
+figS3 <- plot_grid(title, NULL, figS3, ncol = 1, rel_heights = c(0.1, 0.02, 1))
+
+figS3
+
+# save
+ggsave(figS3, file = "figures/figS3.pdf", width = 7, height = 5)
+ggsave(figS3, file = "figures/figS3.png", width = 7, height = 5)
+
+# cleanup
+rm(figS3a, figS3b, figS3c, title)
+```
+
+Calculate slopes for each scenario (on the log-odds scale) when controlling for GDP.
+
+```{r slope Switch m4}
+# slope of RML in Switch scenario
+slope_switch <- post4$bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code + post4$`bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code:ScenarioSwitch`
+quantile(slope_switch, qs) %>% round(2)
+```
+
+```{r slope Loop m4}
+# slope of RML in Loop scenario
+slope_loop <- post4$bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code + post4$`bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code:ScenarioLoop`
+quantile(slope_loop, qs) %>% round(2)
+```
+
+```{r slope Footbridge m4}
+# slope of RML in Footbridge scenario
+slope_foot <- post4$bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code
+quantile(slope_foot, qs) %>% round(2)
+```
+
+The slope remains reliably positive for Footbridge, but not for Switch or Loop.
+
+## 4.5. Controlling for non-independence with measurement error on RML (plus Individualism control)
+
+```{r summarise m5}
+summary(m5)
+```
+
+Plot the predictions of `m5`.
+
+```{r save post5, eval=F, echo=F}
+post5 <- posterior_samples(m5); save(post5, file = "posterior_samples/post5.rda")
+```
+
+```{r plot predictions m5, echo=F}
+load("posterior_samples/post5.rda")
+
+# figS4
+figS4a <- plotPanel("Switch",     post5, me = TRUE, controls = TRUE, asia = FALSE)
+figS4b <- plotPanel("Loop",       post5, me = TRUE, controls = TRUE, asia = FALSE)
+figS4c <- plotPanel("Footbridge", post5, me = TRUE, controls = TRUE, asia = FALSE)
+
+# put together
+title <- makeTitle("Predictions from multilevel model controlling for country\nnon-independence, measurement error, and individualism")
+figS4 <- plot_grid(figS4a, figS4b, figS4c, NULL, legend, nrow = 1, rel_widths = c(1, 1, 1, 0.05, 0.5))
+figS4 <- plot_grid(title, NULL, figS4, ncol = 1, rel_heights = c(0.1, 0.02, 1))
+
+figS4
+
+# save
+ggsave(figS4, file = "figures/figS4.pdf", width = 7, height = 5)
+ggsave(figS4, file = "figures/figS4.png", width = 7, height = 5)
+
+# cleanup
+rm(figS4a, figS4b, figS4c, title)
+```
+
+Calculate slopes for each scenario (on the log-odds scale) when controlling for individualism.
+
+```{r slope Switch m5}
+# slope of RML in Switch scenario
+slope_switch <- post5$bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code + post5$`bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code:ScenarioSwitch`
+quantile(slope_switch, qs) %>% round(2)
+```
+
+```{r slope Loop m5}
+# slope of RML in Loop scenario
+slope_loop <- post5$bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code + post5$`bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code:ScenarioLoop`
+quantile(slope_loop, qs) %>% round(2)
+```
+
+```{r slope Footbridge m5}
+# slope of RML in Footbridge scenario
+slope_foot <- post5$bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code
+quantile(slope_foot, qs) %>% round(2)
+```
+
+The slope remains reliably positive for Footbridge, but not for Switch or Loop.
+
+## 4.6. Controlling for non-independence with measurement error on RML (plus Religiosity control)
+
+```{r summarise m6}
+summary(m6)
+```
+
+Plot the predictions of `m6`.
+
+```{r save post6, eval=F, echo=F}
+post6 <- posterior_samples(m6); save(post6, file = "posterior_samples/post6.rda")
+```
+
+```{r plot predictions m6, echo=F}
+load("posterior_samples/post6.rda")
+
+# figS5
+figS5a <- plotPanel("Switch",     post6, me = TRUE, controls = TRUE, asia = FALSE)
+figS5b <- plotPanel("Loop",       post6, me = TRUE, controls = TRUE, asia = FALSE)
+figS5c <- plotPanel("Footbridge", post6, me = TRUE, controls = TRUE, asia = FALSE)
+
+# put together
+title <- makeTitle("Predictions from multilevel model controlling for country\nnon-independence, measurement error, and religiosity")
+figS5 <- plot_grid(figS5a, figS5b, figS5c, NULL, legend, nrow = 1, rel_widths = c(1, 1, 1, 0.05, 0.5))
+figS5 <- plot_grid(title, NULL, figS5, ncol = 1, rel_heights = c(0.1, 0.02, 1))
+
+figS5
+
+# save
+ggsave(figS5, file = "figures/figS5.pdf", width = 7, height = 5)
+ggsave(figS5, file = "figures/figS5.png", width = 7, height = 5)
+
+# cleanup
+rm(figS5a, figS5b, figS5c, title)
+```
+
+Calculate slopes for each scenario (on the log-odds scale) when controlling for religiosity.
+
+```{r slope Switch m6}
+# slope of RML in Switch scenario
+slope_switch <- post6$bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code + post6$`bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code:ScenarioSwitch`
+quantile(slope_switch, qs) %>% round(2)
+```
+
+```{r slope Loop m6}
+# slope of RML in Loop scenario
+slope_loop <- post6$bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code + post6$`bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code:ScenarioLoop`
+quantile(slope_loop, qs) %>% round(2)
+```
+
+```{r slope Footbridge m6}
+# slope of RML in Footbridge scenario
+slope_foot <- post6$bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code
+quantile(slope_foot, qs) %>% round(2)
+```
+
+The slope remains reliably positive for Footbridge, but not for Switch or Loop.
+
+## 4.7. Controlling for non-independence without measurement error on RML (Asian subset)
+
+```{r summarise m7}
+summary(m7)
+```
+
+Plot the predictions of `m7`.
+
+```{r save post7, eval=F, echo=F}
+post7 <- posterior_samples(m7); save(post7, file = "posterior_samples/post7.rda")
+```
+
+```{r plot predictions m7, echo=F, warning=F, message=F}
+load("posterior_samples/post7.rda")
+
+# figS6
+figS6a <- plotPanel("Switch",     post7, me = FALSE, controls = FALSE, asia = TRUE) + scale_colour_manual(values = "#2E1B3C")
+figS6b <- plotPanel("Loop",       post7, me = FALSE, controls = FALSE, asia = TRUE) + scale_colour_manual(values = "#2E1B3C")
+figS6c <- plotPanel("Footbridge", post7, me = FALSE, controls = FALSE, asia = TRUE) + scale_colour_manual(values = "#2E1B3C")
+
+# put together
+legend <- 
+  get_legend(
+    figS6a + 
+      theme(
+        legend.position = "right",
+        legend.title = element_blank(),
+        legend.text = element_text(size = 10)
+        )
+    )
+title <- makeTitle("Predictions from multilevel model controlling for country\nnon-independence (no measurement error; Asian subset)")
+figS6 <- plot_grid(figS6a, figS6b, figS6c, NULL, legend, nrow = 1, rel_widths = c(1, 1, 1, 0.05, 0.5))
+figS6 <- plot_grid(title, NULL, figS6, ncol = 1, rel_heights = c(0.1, 0.02, 1))
+
+figS6
+
+# save
+ggsave(figS6, file = "figures/figS6.pdf", width = 7, height = 5)
+ggsave(figS6, file = "figures/figS6.png", width = 7, height = 5)
+
+# cleanup
+rm(figS6a, figS6b, figS6c, title)
+```
+
+Calculate slopes for each scenario (on the log-odds scale) for the subset of Asian countries.
+
+```{r slope Switch m7}
+# slope of RML in Switch scenario
+slope_switch <- post7$b_RML + post7$`b_ScenarioSwitch:RML`
+quantile(slope_switch, qs) %>% round(2)
+```
+
+```{r slope Loop m7}
+# slope of RML in Loop scenario
+slope_loop <- post7$b_RML + post7$`b_ScenarioLoop:RML`
+quantile(slope_loop, qs) %>% round(2)
+```
+
+```{r slope Footbridge m7}
+# slope of RML in Footbridge scenario
+slope_foot <- post7$b_RML
+quantile(slope_foot, qs) %>% round(2)
+```
+
+The slopes cross zero for every scenario.
+
+## 4.8. Controlling for non-independence with measurement error on RML (Asian subset)
+
+```{r summarise m8}
+summary(m8)
+```
+
+Plot the predictions of `m8`.
+
+```{r save post8, eval=F, echo=F}
+post8 <- posterior_samples(m8); save(post8, file = "posterior_samples/post8.rda")
+```
+
+```{r plot predictions m8, echo=F, warning=F, message=F}
+load("posterior_samples/post8.rda")
+
+# figS7
+figS7a <- plotPanel("Switch",     post8, me = TRUE, controls = FALSE, asia = TRUE) + scale_colour_manual(values = "#2E1B3C")
+figS7b <- plotPanel("Loop",       post8, me = TRUE, controls = FALSE, asia = TRUE) + scale_colour_manual(values = "#2E1B3C")
+figS7c <- plotPanel("Footbridge", post8, me = TRUE, controls = FALSE, asia = TRUE) + scale_colour_manual(values = "#2E1B3C")
+
+# put together
+title <- makeTitle("Predictions from multilevel model controlling for country\nnon-independence and measurement error (Asian subset)")
+figS7 <- plot_grid(figS7a, figS7b, figS7c, NULL, legend, nrow = 1, rel_widths = c(1, 1, 1, 0.05, 0.5))
+figS7 <- plot_grid(title, NULL, figS7, ncol = 1, rel_heights = c(0.1, 0.02, 1))
+
+figS7
+
+# save
+ggsave(figS7, file = "figures/figS7.pdf", width = 7, height = 5)
+ggsave(figS7, file = "figures/figS7.png", width = 7, height = 5)
+
+# cleanup
+rm(figS7a, figS7b, figS7c, title)
+```
+
+Calculate slopes for each scenario (on the log-odds scale) for the subset of Asian countries.
+
+```{r slope Switch m8}
+# slope of RML in Switch scenario
+slope_switch <- post8$bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code + post8$`bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code:ScenarioSwitch`
+quantile(slope_switch, qs) %>% round(2)
+```
+
+```{r slope Loop m8}
+# slope of RML in Loop scenario
+slope_loop <- post8$bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code + post8$`bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code:ScenarioLoop`
+quantile(slope_loop, qs) %>% round(2)
+```
+
+```{r slope Footbridge m8}
+# slope of RML in Footbridge scenario
+slope_foot <- post8$bsp_mexEQRMLsdxEQRML_SEgrEQcountry_code
+quantile(slope_foot, qs) %>% round(2)
+```
+
+The slopes cross zero for every scenario.
+
+# Session Info
+
+```{r session info}
+sessionInfo()
+```
+
+# References
